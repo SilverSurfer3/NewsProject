@@ -1,0 +1,733 @@
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from bs4 import BeautifulSoup
+from textblob import TextBlob
+from collections import Counter
+import re
+import json
+import time
+from urllib.parse import urlparse
+
+
+class JuventusAlAinPredictor:
+    """
+    Match Predictor for Juventus vs Al Ain
+    With detailed breakdown of what each step is doing
+    """
+
+    def __init__(self):
+        self.match_date = "2025-06-25"
+        self.home_team = "Rapids"
+        self.away_team = "Galaxy"
+        self.match_string = f"{self.home_team} vs {self.away_team}"
+
+        # Your provided URLs
+        self.article_urls = [
+            "https://www.sportsgambler.com/betting-tips/football/colorado-rapids-vs-la-galaxy-prediction-lineups-odds-2025-06-25/",
+            "https://www.sportsmole.co.uk/football/colorado-rapids/preview/colorado-vs-la-galaxy-prediction-team-news-lineups_576032.html",
+            "https://www.dimers.com/news/colorado-rapids-vs-la-galaxy-prediction-mls-ac-6-25-25",
+            "https://pickdawgz.com/mls-picks/colorado-rapids-vs-los-angeles-galaxy-prediction-06-25-2025-picks/",
+            "https://footballwhispers.com/blog/colorado-rapids-vs-los-angeles-galaxy-prediction/",
+            "https://scores24.live/en/soccer/m-26-06-2025-colorado-rapids-los-angeles-galaxy-prediction",
+            "https://www.sportskeeda.com/football/colorado-rapids-vs-la-galaxy-prediction-betting-tips-june-25-2025",
+            "https://www.docsports.com/free-picks/soccer/2025/colorado-rapids-vs-la-galaxy-prediction-6-25-2025-soccer-pick-tips-and-odds.html",
+            "https://www.footboom1.com/en/news/football/2629903-colorado-rapids-los-angeles-galaxy-match-preview-and-prediction",
+            "https://777score.com/news/football/2629899-colorado-rapids-los-angeles-galaxy-match-preview-and-prediction",
+            "https://www.sportytrader.com/us/picks/colorado-rapids-la-galaxy-274163/",
+        ]
+
+        # Storage for our analysis
+        self.article_analyses = []
+        self.consensus_data = {}
+        self.team_stats = {}
+
+    def explain_step(self, step_name, description):
+        """
+        Print explanation of what the model is doing
+        """
+        print(f"\n{'=' * 60}")
+        print(f"🔍 {step_name}")
+        print(f"{'=' * 60}")
+        print(f"📝 {description}")
+        print(f"{'=' * 60}")
+
+    def fetch_article_content(self, url):
+        """
+        STEP 1: WEB SCRAPING
+        What it does: Downloads the webpage and extracts readable text
+        """
+        try:
+            # Set headers to avoid being blocked
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+
+            # Download the webpage
+            response = requests.get(url, headers=headers, timeout=10)
+
+            # Parse HTML using BeautifulSoup
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            # Extract text from article containers
+            text = ""
+            # Look for common article HTML tags
+            for tag in ['article', 'main', 'div.content', 'div.article-body', 'section']:
+                elements = soup.select(tag)
+                if elements:
+                    for elem in elements:
+                        text += elem.get_text() + " "
+
+            # Fallback: get all paragraphs if no article container found
+            if not text:
+                paragraphs = soup.find_all('p')
+                text = ' '.join([p.get_text() for p in paragraphs])
+
+            # Clean the text (remove extra spaces, newlines)
+            text = re.sub(r'\s+', ' ', text).strip()
+
+            return {
+                'url': url,
+                'domain': urlparse(url).netloc,
+                'content': text[:10000],  # Limit to 10k characters
+                'status': 'success'
+            }
+
+        except Exception as e:
+            return {
+                'url': url,
+                'domain': urlparse(url).netloc,
+                'content': '',
+                'status': f'error: {str(e)}'
+            }
+
+    def extract_predictions(self, text):
+        """
+        STEP 2: PREDICTION EXTRACTION
+        What it does: Uses pattern matching to find predictions in the text
+        """
+        predictions = {
+            'winner': None,
+            'scores': [],
+            'over_under': {},
+            'btts': None,
+            'confidence_words': [],
+            'handicap': None
+        }
+
+        # WINNER EXTRACTION
+        # Look for phrases that indicate a winner prediction
+        winner_patterns = [
+            # Direct predictions
+            (r'Juventus\s+(?:to |will |should )\s*win', 'Juventus'),
+            (r'Al[- ]Ain\s+(?:to |will |should )\s*win', 'Al Ain'),
+            # Indirect predictions
+            (r'(?:backing|favou?r|predict|tip).*?Juventus', 'Juventus'),
+            (r'(?:backing|favou?r|predict|tip).*?Al[- ]Ain', 'Al Ain'),
+            # Result predictions
+            (r'Juventus\s+(?:victory|win)', 'Juventus'),
+            (r'Al[- ]Ain\s+(?:victory|win)', 'Al Ain')
+        ]
+
+        for pattern, team in winner_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                predictions['winner'] = team
+                break
+
+        # SCORE EXTRACTION
+        # Look for scoreline predictions (e.g., "2-1", "3-0")
+        score_patterns = [
+            r'(\d)\s*[-–:]\s*(\d)',  # Basic pattern: 2-1, 3:0
+            r'Juventus\s+(\d)\s*[-–:]\s*(\d)\s+Al[- ]Ain',  # Team names included
+            r'Al[- ]Ain\s+(\d)\s*[-–:]\s*(\d)\s+Juventus'  # Reverse order
+        ]
+
+        for pattern in score_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                # Only keep realistic football scores (< 10 goals)
+                if int(match[0]) < 10 and int(match[1]) < 10:
+                    predictions['scores'].append(f"{match[0]}-{match[1]}")
+
+        # OVER/UNDER GOALS EXTRACTION
+        # Look for total goals predictions
+        thresholds = ['0.5', '1.5', '2.5', '3.5', '4.5']
+        for threshold in thresholds:
+            if re.search(rf'over\s+{threshold}\s*goals', text, re.IGNORECASE):
+                predictions['over_under'][f'over_{threshold}'] = 'Yes'
+            elif re.search(rf'under\s+{threshold}\s*goals', text, re.IGNORECASE):
+                predictions['over_under'][f'over_{threshold}'] = 'No'
+
+        # BOTH TEAMS TO SCORE (BTTS)
+        if re.search(r'both\s+teams?\s+(?:to\s+)?score.*?yes', text, re.IGNORECASE):
+            predictions['btts'] = 'Yes'
+        elif re.search(r'both\s+teams?\s+(?:to\s+)?score.*?no', text, re.IGNORECASE):
+            predictions['btts'] = 'No'
+
+        # CONFIDENCE INDICATORS
+        # Words that indicate how confident the prediction is
+        confidence_indicators = ['likely', 'probable', 'certain', 'expect', 'should',
+                                 'will', 'definitely', 'surely', 'confident']
+        for word in confidence_indicators:
+            if word in text.lower():
+                predictions['confidence_words'].append(word)
+
+        # HANDICAP BETTING
+        handicap_match = re.search(r'Juventus\s+[-+](\d+\.?\d*)', text)
+        if handicap_match:
+            predictions['handicap'] = f"Juventus {handicap_match.group(0)}"
+
+        return predictions
+
+    def analyze_sentiment(self, text):
+        """
+        STEP 3: SENTIMENT ANALYSIS
+        What it does: Analyzes the tone/mood of text about each team
+        """
+        # Split text into sentences
+        sentences = text.split('.')
+
+        juventus_sentiments = []
+        al_ain_sentiments = []
+
+        # Analyze sentiment for sentences mentioning each team
+        for sentence in sentences:
+            if len(sentence) > 10:  # Skip very short sentences
+                if 'Juventus' in sentence:
+                    blob = TextBlob(sentence)
+                    juventus_sentiments.append(blob.sentiment.polarity)
+
+                if 'Al Ain' in sentence or 'Al-Ain' in sentence:
+                    blob = TextBlob(sentence)
+                    al_ain_sentiments.append(blob.sentiment.polarity)
+
+        # Calculate average sentiment
+        # Positive = favorable, Negative = unfavorable
+        results = {
+            'juventus_sentiment': np.mean(juventus_sentiments) if juventus_sentiments else 0,
+            'al_ain_sentiment': np.mean(al_ain_sentiments) if al_ain_sentiments else 0,
+            'overall_sentiment': TextBlob(text[:1000]).sentiment.polarity
+        }
+
+        # Determine which team has more positive coverage
+        if results['juventus_sentiment'] > results['al_ain_sentiment'] + 0.1:
+            results['sentiment_favors'] = 'Juventus'
+        elif results['al_ain_sentiment'] > results['juventus_sentiment'] + 0.1:
+            results['sentiment_favors'] = 'Al Ain'
+        else:
+            results['sentiment_favors'] = 'Neutral'
+
+        return results
+
+    def extract_key_information(self, text):
+        """
+        STEP 4: KEY INFORMATION EXTRACTION
+        What it does: Finds important match factors mentioned in articles
+        """
+        key_info = {
+            'injuries': [],
+            'missing_players': [],
+            'key_players': [],
+            'tactical_points': [],
+            'historical_facts': []
+        }
+
+        # INJURY DETECTION
+        injury_patterns = [
+            r'(\w+)\s+(?:is\s+)?(?:injured|ruled out|doubtful|fitness)',
+            r'(?:injury|injuries)\s+to\s+(\w+)',
+            r'(\w+)\s+(?:miss|misses|missing)'
+        ]
+
+        for pattern in injury_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            key_info['injuries'].extend(matches)
+
+        # KEY PLAYER MENTIONS
+        # Look for player names with positive context
+        key_player_patterns = [
+            r'(?:star|key player|talisman)\s+(\w+\s+\w+)',
+            r'(\w+\s+\w+)\s+(?:crucial|important|vital)',
+        ]
+
+        for pattern in key_player_patterns:
+            matches = re.findall(pattern, text)
+            key_info['key_players'].extend(matches)
+
+        # TACTICAL INFORMATION
+        if 'formation' in text.lower() or 'tactics' in text.lower():
+            key_info['tactical_points'].append('Tactical analysis present')
+
+        if 'defensive' in text.lower() and 'solid' in text.lower():
+            key_info['tactical_points'].append('Defensive strength mentioned')
+
+        if 'attacking' in text.lower() or 'offensive' in text.lower():
+            key_info['tactical_points'].append('Attacking play discussed')
+
+        # HISTORICAL CONTEXT
+        if re.search(r'last\s+\d+\s+(?:games|matches)', text):
+            key_info['historical_facts'].append('Recent form discussed')
+
+        if re.search(r'never\s+(?:won|lost|beaten)', text):
+            key_info['historical_facts'].append('Historical record mentioned')
+
+        return key_info
+
+    def analyze_all_articles(self):
+        """
+        MAIN ANALYSIS LOOP
+        What it does: Processes each article through all analysis steps
+        """
+        self.explain_step(
+            "STARTING ARTICLE ANALYSIS",
+            "The model will now analyze each article in 4 steps:\n" +
+            "1. Web Scraping - Download and extract text\n" +
+            "2. Prediction Extraction - Find winner, score, and bet predictions\n" +
+            "3. Sentiment Analysis - Measure tone towards each team\n" +
+            "4. Key Info Extraction - Find injuries, tactics, and important factors"
+        )
+
+        for i, url in enumerate(self.article_urls, 1):
+            print(f"\n📰 Article {i}/{len(self.article_urls)}: {urlparse(url).netloc}")
+
+            # Step 1: Fetch content
+            print("  Step 1: Fetching article content...")
+            article_data = self.fetch_article_content(url)
+
+            if article_data['status'] != 'success':
+                print(f"  ❌ Failed to fetch: {article_data['status']}")
+                continue
+
+            print(f"  ✅ Fetched {len(article_data['content'])} characters")
+
+            # Step 2: Extract predictions
+            print("  Step 2: Extracting predictions...")
+            predictions = self.extract_predictions(article_data['content'])
+            print(f"  ✅ Found: Winner={predictions['winner']}, Scores={len(predictions['scores'])}")
+
+            # Step 3: Sentiment analysis
+            print("  Step 3: Analyzing sentiment...")
+            sentiment = self.analyze_sentiment(article_data['content'])
+            print(f"  ✅ Sentiment favors: {sentiment['sentiment_favors']}")
+
+            # Step 4: Extract key information
+            print("  Step 4: Extracting key information...")
+            key_info = self.extract_key_information(article_data['content'])
+            print(f"  ✅ Found {len(key_info['injuries'])} injury mentions")
+
+            # Store complete analysis
+            self.article_analyses.append({
+                'url': url,
+                'predictions': predictions,
+                'sentiment': sentiment,
+                'key_info': key_info
+            })
+
+            # Be nice to servers
+            time.sleep(1)
+
+    def build_consensus(self):
+        """
+        STEP 5: CONSENSUS BUILDING
+        What it does: Combines all predictions to find the most likely outcomes
+        """
+        self.explain_step(
+            "BUILDING CONSENSUS",
+            "The model now combines all predictions using:\n" +
+            "1. Majority voting for winner predictions\n" +
+            "2. Frequency analysis for score predictions\n" +
+            "3. Percentage calculations for over/under bets\n" +
+            "4. Confidence scoring based on agreement levels"
+        )
+
+        # Initialize collectors
+        all_winners = []
+        all_scores = []
+        all_btts = []
+        over_under_votes = {
+            '0.5': [], '1.5': [], '2.5': [], '3.5': [], '4.5': []
+        }
+        all_sentiments = {'juventus': [], 'al_ain': []}
+        all_injuries = []
+
+        # Collect all predictions
+        for analysis in self.article_analyses:
+            # Winners
+            if analysis['predictions']['winner']:
+                all_winners.append(analysis['predictions']['winner'])
+
+            # Scores
+            all_scores.extend(analysis['predictions']['scores'])
+
+            # BTTS
+            if analysis['predictions']['btts']:
+                all_btts.append(analysis['predictions']['btts'])
+
+            # Over/Under
+            for threshold in over_under_votes.keys():
+                key = f'over_{threshold}'
+                if key in analysis['predictions']['over_under']:
+                    over_under_votes[threshold].append(
+                        analysis['predictions']['over_under'][key]
+                    )
+
+            # Sentiments
+            all_sentiments['juventus'].append(analysis['sentiment']['juventus_sentiment'])
+            all_sentiments['al_ain'].append(analysis['sentiment']['al_ain_sentiment'])
+
+            # Injuries
+            all_injuries.extend(analysis['key_info']['injuries'])
+
+        # BUILD CONSENSUS
+        consensus = {
+            'sources_analyzed': len(self.article_analyses),
+            'match': self.match_string,
+            'date': self.match_date
+        }
+
+        # Winner consensus
+        if all_winners:
+            winner_counts = Counter(all_winners)
+            most_common = winner_counts.most_common(1)[0]
+            total_predictions = len(all_winners)
+
+            consensus['winner'] = {
+                'prediction': most_common[0],
+                'votes': f"{most_common[1]}/{total_predictions}",
+                'confidence': f"{(most_common[1] / total_predictions * 100):.0f}%",
+                'all_predictions': dict(winner_counts)
+            }
+
+            print(f"\n🏆 Winner Consensus: {most_common[0]} with {most_common[1]}/{total_predictions} votes")
+
+        # Score consensus
+        if all_scores:
+            score_counts = Counter(all_scores)
+            top_scores = score_counts.most_common(3)
+
+            consensus['scores'] = {
+                'most_likely': top_scores[0][0],
+                'frequency': f"{top_scores[0][1]}/{len(all_scores)}",
+                'alternatives': [s[0] for s in top_scores[1:]]
+            }
+
+            # Calculate average goals
+            total_goals = []
+            for score in all_scores:
+                try:
+                    h, a = map(int, score.split('-'))
+                    total_goals.append(h + a)
+                except:
+                    pass
+
+            if total_goals:
+                consensus['average_total_goals'] = np.mean(total_goals)
+
+            print(f"📊 Most likely score: {top_scores[0][0]} (appeared {top_scores[0][1]} times)")
+
+        # Over/Under consensus
+        consensus['over_under'] = {}
+        for threshold, votes in over_under_votes.items():
+            if votes:
+                yes_votes = votes.count('Yes')
+                total_votes = len(votes)
+                percentage = (yes_votes / total_votes) * 100
+
+                # Determine safety level
+                if percentage >= 85:
+                    safety = "VERY SAFE ✅"
+                elif percentage >= 70:
+                    safety = "SAFE ✅"
+                elif percentage >= 55:
+                    safety = "MODERATE ⚠️"
+                elif percentage >= 40:
+                    safety = "RISKY ⚠️"
+                else:
+                    safety = "VERY RISKY ❌"
+
+                consensus['over_under'][f'over_{threshold}'] = {
+                    'recommendation': 'Yes' if yes_votes > total_votes / 2 else 'No',
+                    'confidence': f"{max(yes_votes, total_votes - yes_votes) / total_votes * 100:.0f}%",
+                    'safety': safety,
+                    'votes': f"{yes_votes}/{total_votes}"
+                }
+
+        # BTTS consensus
+        if all_btts:
+            yes_votes = all_btts.count('Yes')
+            consensus['btts'] = {
+                'prediction': 'Yes' if yes_votes > len(all_btts) / 2 else 'No',
+                'confidence': f"{max(yes_votes, len(all_btts) - yes_votes) / len(all_btts) * 100:.0f}%",
+                'votes': f"{yes_votes}/{len(all_btts)}"
+            }
+
+        # Sentiment consensus
+        consensus['sentiment'] = {
+            'juventus_avg': np.mean(all_sentiments['juventus']),
+            'al_ain_avg': np.mean(all_sentiments['al_ain']),
+            'favors': 'Juventus' if np.mean(all_sentiments['juventus']) > np.mean(
+                all_sentiments['al_ain']) else 'Al Ain'
+        }
+
+        # Injury report
+        if all_injuries:
+            injury_counts = Counter(all_injuries)
+            consensus['injuries'] = injury_counts.most_common(5)
+
+        self.consensus_data = consensus
+        return consensus
+
+    def generate_recommendations(self):
+        """
+        STEP 6: BETTING RECOMMENDATIONS
+        What it does: Creates specific betting advice based on confidence levels
+        """
+        self.explain_step(
+            "GENERATING RECOMMENDATIONS",
+            "The model creates betting recommendations by:\n" +
+            "1. Categorizing bets by risk level (Safe/Moderate/Risky)\n" +
+            "2. Only recommending bets with sufficient confidence\n" +
+            "3. Providing reasoning for each recommendation"
+        )
+
+        recommendations = {
+            'safe_bets': [],
+            'moderate_bets': [],
+            'risky_bets': []
+        }
+
+        consensus = self.consensus_data
+
+        # Winner bet
+        if 'winner' in consensus:
+            confidence = int(consensus['winner']['confidence'].rstrip('%'))
+            if confidence >= 80:
+                recommendations['safe_bets'].append({
+                    'bet': f"{consensus['winner']['prediction']} to Win",
+                    'confidence': consensus['winner']['confidence'],
+                    'reasoning': f"Strong consensus with {consensus['winner']['votes']} votes"
+                })
+            elif confidence >= 65:
+                recommendations['moderate_bets'].append({
+                    'bet': f"{consensus['winner']['prediction']} to Win",
+                    'confidence': consensus['winner']['confidence'],
+                    'reasoning': "Moderate consensus among sources"
+                })
+
+        # Over/Under bets
+        for threshold, data in consensus.get('over_under', {}).items():
+            if 'VERY SAFE' in data['safety']:
+                recommendations['safe_bets'].append({
+                    'bet': f"Over {threshold.split('_')[1]} Goals",
+                    'confidence': data['confidence'],
+                    'safety': data['safety'],
+                    'votes': data['votes']
+                })
+            elif 'SAFE' in data['safety']:
+                recommendations['moderate_bets'].append({
+                    'bet': f"Over {threshold.split('_')[1]} Goals",
+                    'confidence': data['confidence'],
+                    'safety': data['safety']
+                })
+
+        # BTTS
+        if 'btts' in consensus:
+            confidence = int(consensus['btts']['confidence'].rstrip('%'))
+            if confidence >= 70:
+                recommendations['moderate_bets'].append({
+                    'bet': f"Both Teams to Score - {consensus['btts']['prediction']}",
+                    'confidence': consensus['btts']['confidence']
+                })
+
+        # Score bet (always risky)
+        if 'scores' in consensus:
+            recommendations['risky_bets'].append({
+                'bet': f"Exact Score: {consensus['scores']['most_likely']}",
+                'frequency': consensus['scores']['frequency'],
+                'reasoning': "Exact scores are always high risk"
+            })
+
+        return recommendations
+
+    def generate_final_report(self):
+        """
+        FINAL STEP: REPORT GENERATION
+        What it does: Creates a comprehensive, easy-to-read report
+        """
+        consensus = self.consensus_data
+        recommendations = self.generate_recommendations()
+
+        report = f"""
+{'=' * 70}
+⚽ JUVENTUS vs AL AIN - MATCH PREDICTION REPORT
+{'=' * 70}
+📅 Match Date: {consensus['date']}
+📊 Sources Analyzed: {consensus['sources_analyzed']}
+🕐 Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+{'=' * 70}
+🏆 MATCH OUTCOME PREDICTION
+{'=' * 70}"""
+
+        if 'winner' in consensus:
+            report += f"""
+Winner Prediction: {consensus['winner']['prediction']}
+Confidence Level: {consensus['winner']['confidence']}
+Vote Distribution: {consensus['winner']['votes']}
+
+All Predictions:"""
+            for team, votes in consensus['winner']['all_predictions'].items():
+                report += f"\n  • {team}: {votes} votes"
+
+        if 'scores' in consensus:
+            report += f"""
+
+📈 SCORE PREDICTIONS
+{'=' * 70}
+Most Likely Score: {consensus['scores']['most_likely']}
+Frequency: {consensus['scores']['frequency']}"""
+            if consensus['scores']['alternatives']:
+                report += f"\nAlternative Scores: {', '.join(consensus['scores']['alternatives'])}"
+            if 'average_total_goals' in consensus:
+                report += f"\nAverage Total Goals: {consensus['average_total_goals']:.1f}"
+
+        report += f"""
+
+🎯 GOALS MARKET ANALYSIS
+{'=' * 70}"""
+        for threshold, data in consensus.get('over_under', {}).items():
+            report += f"""
+{threshold.replace('_', ' ').title()} Goals:
+  Recommendation: {data['recommendation']}
+  Confidence: {data['confidence']}
+  Safety Level: {data['safety']}
+  Votes: {data['votes']}
+"""
+
+        if 'btts' in consensus:
+            report += f"""
+⚽ BOTH TEAMS TO SCORE
+{'=' * 70}
+Prediction: {consensus['btts']['prediction']}
+Confidence: {consensus['btts']['confidence']}
+Votes: {consensus['btts']['votes']}
+"""
+
+        report += f"""
+💡 BETTING RECOMMENDATIONS
+{'=' * 70}"""
+
+        if recommendations['safe_bets']:
+            report += "\n✅ SAFE BETS (Low Risk):\n"
+            for bet in recommendations['safe_bets']:
+                report += f"  • {bet['bet']} - {bet['confidence']}\n"
+                if 'reasoning' in bet:
+                    report += f"    Reason: {bet['reasoning']}\n"
+
+        if recommendations['moderate_bets']:
+            report += "\n⚠️ MODERATE BETS (Medium Risk):\n"
+            for bet in recommendations['moderate_bets']:
+                report += f"  • {bet['bet']} - {bet['confidence']}\n"
+
+        if recommendations['risky_bets']:
+            report += "\n❌ RISKY BETS (High Risk - Not Recommended):\n"
+            for bet in recommendations['risky_bets']:
+                report += f"  • {bet['bet']}\n"
+
+        if 'injuries' in consensus:
+            report += f"""
+
+🏥 INJURY REPORT
+{'=' * 70}"""
+            for player, count in consensus['injuries']:
+                report += f"\n  • {player}: mentioned {count} times"
+
+        report += f"""
+
+📊 SENTIMENT ANALYSIS
+{'=' * 70}
+Juventus Sentiment Score: {consensus['sentiment']['juventus_avg']:.2f}
+Al Ain Sentiment Score: {consensus['sentiment']['al_ain_avg']:.2f}
+Overall Sentiment Favors: {consensus['sentiment']['favors']}
+
+{'=' * 70}
+⚠️ DISCLAIMER: This analysis is for informational purposes only.
+   Always gamble responsibly and within your means.
+{'=' * 70}
+"""
+
+        return report
+
+    def run_complete_analysis(self):
+        """
+        Master function that runs the entire analysis pipeline
+        """
+        print("\n🚀 Starting Juventus vs Al Ain Match Analysis...")
+        print(f"📅 Match Date: {self.match_date}")
+        print(f"📰 Articles to Analyze: {len(self.article_urls)}")
+
+        # Step 1: Analyze all articles
+        self.analyze_all_articles()
+
+        # Step 2: Build consensus
+        self.build_consensus()
+
+        # Step 3: Generate report
+        report = self.generate_final_report()
+
+        return report
+
+
+# HOW THE MODEL WORKS - DETAILED BREAKDOWN
+"""
+MODEL ARCHITECTURE EXPLAINED:
+
+1. DATA COLLECTION (Web Scraping)
+   - Uses requests library to download web pages
+   - BeautifulSoup parses HTML to extract text
+   - Handles different website structures
+
+2. NATURAL LANGUAGE PROCESSING
+   - Regular expressions find specific patterns (scores, predictions)
+   - TextBlob performs sentiment analysis
+   - Pattern matching identifies key information
+
+3. STATISTICAL ANALYSIS
+   - Counter objects track frequency of predictions
+   - NumPy calculates averages and statistics
+   - Percentage calculations determine confidence
+
+4. CONSENSUS ALGORITHM
+   - Majority voting for categorical predictions (winner)
+   - Frequency analysis for numerical predictions (scores)
+   - Weighted averaging for continuous values (sentiment)
+
+5. RISK ASSESSMENT
+   - Thresholds based on agreement percentages
+   - Multiple confidence levels (Very Safe to Very Risky)
+   - Considers both frequency and consistency
+
+6. RECOMMENDATION ENGINE
+   - Filters predictions by confidence level
+   - Categorizes by risk (Safe/Moderate/Risky)
+   - Provides reasoning for each recommendation
+"""
+
+# Main execution
+if __name__ == "__main__":
+    # Create predictor instance
+    predictor = JuventusAlAinPredictor()
+
+    # Run the complete analysis
+    report = predictor.run_complete_analysis()
+
+    # Print the report
+    print(report)
+
+    # Save to file
+    filename = f"Juventus_vs_AlAin_prediction_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(report)
+
+    print(f"\n✅ Report saved to: {filename}")
