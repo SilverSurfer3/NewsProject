@@ -1,0 +1,1537 @@
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from bs4 import BeautifulSoup
+from collections import Counter, defaultdict
+import re
+import time
+from urllib.parse import urlparse
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ML Libraries
+import torch
+from transformers import (
+    pipeline,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AutoModelForTokenClassification
+)
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.ensemble import RandomForestClassifier
+import spacy
+from textblob import TextBlob
+import joblib
+import json
+
+
+class MLEnhancedMatchPredictor:
+    """
+    Advanced Match Predictor using Machine Learning
+    Features: Bias detection, quality scoring, confidence extraction,
+              duplicate detection, implicit prediction understanding
+    """
+
+    def __init__(self, match_info):
+        self.home_team = match_info['home_team']
+        self.away_team = match_info['away_team']
+        self.match_date = match_info['match_date']
+        self.article_urls = match_info['urls']
+
+        # Initialize ML models
+        print("🤖 Loading ML models...")
+        self.initialize_ml_models()
+
+        # Storage
+        self.article_analyses = []
+        self.consensus_data = {}
+        self.quality_scores = {}
+
+    def initialize_ml_models(self):
+        """Initialize all ML models"""
+        try:
+            # Sentiment Analysis
+            self.sentiment_pipeline = pipeline(
+                "sentiment-analysis",
+                model="nlptown/bert-base-multilingual-uncased-sentiment"
+            )
+
+            # Text Classification for predictions
+            self.classifier = pipeline(
+                "zero-shot-classification",
+                model="facebook/bart-large-mnli"
+            )
+
+            # Named Entity Recognition
+            self.ner_pipeline = pipeline(
+                "ner",
+                model="dbmdz/bert-large-cased-finetuned-conll03-english"
+            )
+
+            # Load spaCy for advanced NLP
+            self.nlp = spacy.load("en_core_web_sm")
+
+            # TF-IDF for similarity detection
+            self.tfidf_vectorizer = TfidfVectorizer(
+                max_features=1000,
+                stop_words='english'
+            )
+
+            print("✅ ML models loaded successfully")
+
+        except Exception as e:
+            print(f"⚠️ Some ML models couldn't load: {e}")
+            print("Falling back to basic models...")
+            self.sentiment_pipeline = None
+            self.classifier = None
+            self.nlp = None
+
+    def fetch_article_content(self, url):
+        """Enhanced web scraping with metadata extraction"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+
+            response = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            # Remove scripts and styles
+            for script in soup(["script", "style", "noscript"]):
+                script.decompose()
+
+            # Extract text
+            text = ""
+            selectors = [
+                'article', 'main', 'div.content', 'div.article-body',
+                'section.content', '.post-content', '.entry-content'
+            ]
+
+            for selector in selectors:
+                elements = soup.select(selector)
+                if elements:
+                    for elem in elements:
+                        text += elem.get_text(separator=' ', strip=True) + " "
+                    if len(text) > 500:
+                        break
+
+            if len(text) < 500:
+                paragraphs = soup.find_all('p')
+                text = ' '.join([p.get_text(strip=True) for p in paragraphs])
+
+            # Extract metadata
+            author = self._extract_author(soup)
+            publish_date = self._extract_date(soup)
+
+            # Clean text
+            text = re.sub(r'\s+', ' ', text).strip()
+
+            return {
+                'url': url,
+                'domain': urlparse(url).netloc,
+                'content': text[:15000],
+                'author': author,
+                'publish_date': publish_date,
+                'status': 'success'
+            }
+
+        except Exception as e:
+            return {
+                'url': url,
+                'domain': urlparse(url).netloc,
+                'content': '',
+                'status': f'error: {str(e)}'
+            }
+
+    def _extract_author(self, soup):
+        """Extract author from article"""
+        author_selectors = [
+            'span.author', 'div.author', 'p.author',
+            'span.by-author', 'span.ArticleHeader-author'
+        ]
+
+        for selector in author_selectors:
+            author = soup.select_one(selector)
+            if author:
+                return author.get_text(strip=True)
+
+        # Check meta tags
+        author_meta = soup.find('meta', {'name': 'author'})
+        if author_meta:
+            return author_meta.get('content', '')
+
+        return 'Unknown'
+
+    def _extract_date(self, soup):
+        """Extract publish date from article"""
+        date_selectors = [
+            'time', 'span.date', 'div.date', 'p.date',
+            'span.publish-date', 'span.ArticleHeader-date'
+        ]
+
+        for selector in date_selectors:
+            date_elem = soup.select_one(selector)
+            if date_elem:
+                return date_elem.get_text(strip=True)
+
+        return None
+
+    def extract_predictions_ml(self, text):
+        """Extract predictions using ML + pattern matching"""
+        predictions = {
+            'winner': None,
+            'winner_confidence': 0,
+            'scores': [],
+            'over_under': {},
+            'btts': None,
+            'implicit_predictions': {},
+            'confidence_phrases': [],
+            'reasoning_quality': 0
+        }
+
+        # Check if text is empty
+        if not text or len(text.strip()) < 10:
+            print("  ⚠️ Text too short for ML analysis, skipping...")
+            return predictions
+
+        # 1. PATTERN MATCHING (Original approach)
+        predictions.update(self._pattern_based_extraction(text))
+
+        # 2. ML-BASED EXTRACTION
+        if self.classifier and len(text) > 50:  # Need minimum text length
+            try:
+                # Zero-shot classification for winner
+                winner_labels = [self.home_team, self.away_team, "Draw"]
+
+                # Use first 1000 chars or full text if shorter
+                text_sample = text[:1000] if len(text) > 1000 else text
+
+                result = self.classifier(
+                    text_sample,
+                    candidate_labels=winner_labels,
+                    hypothesis_template="This text predicts {} will win the match"
+                )
+
+                # ML prediction
+                ml_winner = result['labels'][0]
+                ml_confidence = result['scores'][0]
+
+                # Combine with pattern matching
+                if not predictions['winner'] and ml_confidence > 0.6:
+                    predictions['winner'] = ml_winner
+                    predictions['winner_confidence'] = ml_confidence
+
+                # Extract implicit predictions
+                predictions['implicit_predictions'] = {
+                    'ml_winner': ml_winner,
+                    'ml_confidence': ml_confidence,
+                    'all_scores': dict(zip(result['labels'], result['scores']))
+                }
+            except Exception as e:
+                print(f"  ⚠️ ML classification error: {str(e)}")
+                # Continue with pattern-based results
+
+        # 3. CONFIDENCE PHRASE EXTRACTION
+        predictions['confidence_phrases'] = self._extract_confidence_phrases(text)
+
+        # 4. REASONING QUALITY ASSESSMENT
+        predictions['reasoning_quality'] = self._assess_reasoning_quality(text)
+
+        return predictions
+
+    def _pattern_based_extraction(self, text):
+        """Original pattern-based extraction"""
+        results = {}
+
+        # Winner patterns
+        winner_patterns = [
+            (rf'{self.home_team}\s+(?:to |will |should )\s*win', self.home_team),
+            (rf'{self.away_team}\s+(?:to |will |should )\s*win', self.away_team),
+            (r'draw|tie|stalemate', 'Draw')
+        ]
+
+        for pattern, team in winner_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                results['winner'] = team
+                break
+
+        # Score extraction
+        score_patterns = [
+            r'(?:predict|prediction|forecast).*?(\d)\s*[-–:]\s*(\d)',
+            rf'{self.home_team}\s+(\d)\s*[-–:]\s*(\d)\s*{self.away_team}'
+        ]
+
+        scores = set()
+        for pattern in score_patterns:
+            matches = re.findall(pattern, text[:5000], re.IGNORECASE)
+            for match in matches:
+                if int(match[0]) < 7 and int(match[1]) < 7:
+                    scores.add(f"{match[0]}-{match[1]}")
+
+        results['scores'] = list(scores)
+
+        # Over/Under
+        over_under = {}
+        for threshold in ['0.5', '1.5', '2.5', '3.5', '4.5']:
+            if re.search(rf'over\s+{threshold}', text, re.IGNORECASE):
+                over_under[threshold] = 'Over'
+            elif re.search(rf'under\s+{threshold}', text, re.IGNORECASE):
+                over_under[threshold] = 'Under'
+
+        results['over_under'] = over_under
+
+        # BTTS
+        if re.search(r'both\s+teams?\s+(?:to\s+)?score.*?(?:yes|likely)', text, re.IGNORECASE):
+            results['btts'] = 'Yes'
+        elif re.search(r'both\s+teams?\s+(?:to\s+)?score.*?(?:no|unlikely)', text, re.IGNORECASE):
+            results['btts'] = 'No'
+
+        return results
+
+    def _extract_confidence_phrases(self, text):
+        """Extract confidence indicators using ML"""
+        confidence_indicators = {
+            'high': ['certainly', 'definitely', 'surely', 'will definitely', 'guaranteed', 'confident'],
+            'medium': ['should', 'likely', 'probably', 'expected', 'favored'],
+            'low': ['might', 'could', 'possibly', 'perhaps', 'maybe']
+        }
+
+        found_phrases = {
+            'high': 0,
+            'medium': 0,
+            'low': 0
+        }
+
+        text_lower = text.lower()
+        for level, phrases in confidence_indicators.items():
+            for phrase in phrases:
+                found_phrases[level] += len(re.findall(rf'\b{phrase}\b', text_lower))
+
+        return found_phrases
+
+    def _assess_reasoning_quality(self, text):
+        """Assess quality of reasoning in prediction"""
+        quality_score = 0
+
+        # Check for statistics
+        stats_patterns = [
+            r'\d+\.?\d*%',  # Percentages
+            r'scored \d+ goals',  # Goal statistics
+            r'won \d+ of',  # Win records
+            r'average of \d+',  # Averages
+            r'xG|expected goals',  # Advanced metrics
+            r'possession',  # Tactical stats
+        ]
+
+        for pattern in stats_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                quality_score += 1
+
+        # Check for tactical analysis
+        tactical_terms = [
+            'formation', 'tactics', 'pressing', 'counter-attack',
+            'defensive', 'attacking', 'midfield', 'strategy'
+        ]
+
+        for term in tactical_terms:
+            if term in text.lower():
+                quality_score += 0.5
+
+        # Check for player analysis
+        if re.search(r'injured|suspended|unavailable', text, re.IGNORECASE):
+            quality_score += 1
+
+        # Check for historical context
+        if re.search(r'last \d+ (?:games|matches|meetings)', text, re.IGNORECASE):
+            quality_score += 1
+
+        return min(quality_score, 10)  # Cap at 10
+
+    def detect_bias_indicators(self, text, domain):
+        """Detect various types of bias in article"""
+        bias_scores = {
+            'promotional_bias': 0,
+            'recency_bias': 0,
+            'favorite_bias': 0,
+            'home_bias': 0,
+            'affiliate_bias': 0
+        }
+
+        # 1. Promotional bias (betting site promotion)
+        promo_patterns = [
+            r'bet now', r'claim bonus', r'special offer',
+            r'promoted odds', r'enhanced odds', r'sign up',
+            r'deposit bonus', r'free bet'
+        ]
+
+        for pattern in promo_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                bias_scores['promotional_bias'] += 1
+
+        # 2. Recency bias (overweighting recent results)
+        recent_patterns = [
+            r'last (?:game|match)', r'recent form',
+            r'current streak', r'lately'
+        ]
+
+        historical_patterns = [
+            r'historically', r'all-time record',
+            r'head-to-head', r'past meetings'
+        ]
+
+        recent_count = sum(1 for p in recent_patterns if re.search(p, text, re.IGNORECASE))
+        historical_count = sum(1 for p in historical_patterns if re.search(p, text, re.IGNORECASE))
+
+        if recent_count > historical_count * 2:
+            bias_scores['recency_bias'] = (recent_count - historical_count) / max(recent_count, 1)
+
+        # 3. Favorite bias (always picking favorites)
+        if 'underdog' not in text.lower() and 'upset' not in text.lower():
+            bias_scores['favorite_bias'] += 0.5
+
+        # 4. Affiliate bias
+        if re.search(r'affiliate|partner|sponsored', text, re.IGNORECASE):
+            bias_scores['affiliate_bias'] += 1
+
+        return bias_scores
+
+    def detect_duplicate_content(self, all_articles):
+        """Detect if articles are copying each other"""
+        if len(all_articles) < 2:
+            return []
+
+        # Extract non-empty content
+        valid_articles = []
+        contents = []
+        for article in all_articles:
+            if article.get('content') and len(article['content'].strip()) > 100:
+                valid_articles.append(article)
+                contents.append(article['content'])
+
+        if len(contents) < 2:
+            print("  ℹ️ Not enough valid content for duplicate detection")
+            return []
+
+        try:
+            # Vectorize
+            vectors = self.tfidf_vectorizer.fit_transform(contents)
+
+            # Calculate similarity
+            similarity_matrix = cosine_similarity(vectors)
+
+            # Find duplicates
+            duplicates = []
+            for i in range(len(contents)):
+                for j in range(i + 1, len(contents)):
+                    similarity = similarity_matrix[i][j]
+                    if similarity > 0.8:  # 80% similar
+                        duplicates.append({
+                            'article1': valid_articles[i]['url'],
+                            'article2': valid_articles[j]['url'],
+                            'similarity': similarity
+                        })
+
+            return duplicates
+
+        except Exception as e:
+            print(f"  ⚠️ Duplicate detection error: {str(e)}")
+            return []
+
+    def calculate_source_credibility(self, article_analysis):
+        """Calculate credibility score for each source"""
+        credibility_score = 5.0  # Start at neutral
+
+        # Domain reputation (you can expand this)
+        trusted_domains = ['espn.com', 'bbc.com', 'skysports.com', 'athletic.com']
+        questionable_domains = ['betting-tips-free.com', 'sure-wins.com']
+
+        domain = article_analysis['domain']
+
+        if any(trusted in domain for trusted in trusted_domains):
+            credibility_score += 2
+        elif any(questionable in domain for questionable in questionable_domains):
+            credibility_score -= 2
+
+        # Reasoning quality
+        reasoning_score = article_analysis['predictions']['reasoning_quality']
+        credibility_score += (reasoning_score / 10) * 2  # Max +2
+
+        # Bias penalties
+        bias_scores = article_analysis['bias_scores']
+        total_bias = sum(bias_scores.values())
+        credibility_score -= min(total_bias, 3)  # Max -3 penalty
+
+        # Statistical evidence bonus
+        if reasoning_score > 5:
+            credibility_score += 1
+
+        # Normalize to 0-10
+        return max(0, min(10, credibility_score))
+
+    def analyze_all_articles_ml(self):
+        """Analyze all articles with ML enhancements"""
+        print("\n🤖 Starting ML-Enhanced Analysis...")
+        print("=" * 60)
+
+        all_article_data = []
+
+        for i, url in enumerate(self.article_urls, 1):
+            print(f"\n📰 Article {i}/{len(self.article_urls)}: {urlparse(url).netloc}")
+
+            # Fetch content
+            article_data = self.fetch_article_content(url)
+
+            if article_data['status'] != 'success' or not article_data['content'] or len(
+                    article_data['content'].strip()) < 50:
+                if article_data['status'] != 'success':
+                    print(f"  ❌ Failed: {article_data['status']}")
+                else:
+                    print(f"  ❌ No content found (empty article)")
+                continue
+
+            print(f"  ✅ Fetched {len(article_data['content'])} characters")
+
+            # Extract predictions with ML
+            predictions = self.extract_predictions_ml(article_data['content'])
+
+            # Sentiment analysis
+            sentiment = self._analyze_sentiment_ml(article_data['content'])
+
+            # Bias detection
+            bias_scores = self.detect_bias_indicators(
+                article_data['content'],
+                article_data['domain']
+            )
+
+            # Store analysis
+            analysis = {
+                'url': url,
+                'domain': article_data['domain'],
+                'author': article_data['author'],
+                'predictions': predictions,
+                'sentiment': sentiment,
+                'bias_scores': bias_scores,
+                'content': article_data['content']
+            }
+
+            # Calculate credibility
+            analysis['credibility_score'] = self.calculate_source_credibility(analysis)
+
+            self.article_analyses.append(analysis)
+            all_article_data.append(article_data)
+
+            print(f"  📊 ML Confidence: {predictions.get('implicit_predictions', {}).get('ml_confidence', 0):.2f}")
+            print(f"  🎯 Reasoning Quality: {predictions['reasoning_quality']}/10")
+            print(f"  ⚖️ Credibility Score: {analysis['credibility_score']:.1f}/10")
+
+            time.sleep(1)
+
+        # Detect duplicate content
+        print("\n🔍 Checking for duplicate content...")
+        duplicates = self.detect_duplicate_content(all_article_data)
+
+        if duplicates:
+            print(f"⚠️ Found {len(duplicates)} duplicate article pairs!")
+            for dup in duplicates:
+                print(
+                    f"  • {urlparse(dup['article1']).netloc} ↔ {urlparse(dup['article2']).netloc} ({dup['similarity']:.0%} similar)")
+
+        return duplicates
+
+    def _analyze_sentiment_ml(self, text):
+        """Advanced sentiment analysis using ML"""
+        # Check for empty text
+        if not text or len(text.strip()) < 10:
+            return {
+                'ml_sentiment': 0,
+                'confidence': 0,
+                'method': 'None (empty text)'
+            }
+
+        if self.sentiment_pipeline:
+            try:
+                # Use BERT-based sentiment
+                text_sample = text[:512] if len(text) > 512 else text  # BERT limit
+                result = self.sentiment_pipeline(text_sample)
+
+                # Convert 1-5 star rating to -1 to 1 scale
+                stars = int(result[0]['label'].split()[0])
+                sentiment_score = (stars - 3) / 2  # Convert to -1 to 1
+
+                return {
+                    'ml_sentiment': sentiment_score,
+                    'confidence': result[0]['score'],
+                    'method': 'BERT'
+                }
+            except Exception as e:
+                print(f"  ⚠️ Sentiment analysis error: {str(e)}")
+
+        # Fallback to TextBlob
+        try:
+            text_sample = text[:1000] if len(text) > 1000 else text
+            blob = TextBlob(text_sample)
+            return {
+                'ml_sentiment': blob.sentiment.polarity,
+                'confidence': abs(blob.sentiment.polarity),
+                'method': 'TextBlob'
+            }
+        except:
+            return {
+                'ml_sentiment': 0,
+                'confidence': 0,
+                'method': 'Failed'
+            }
+
+    def build_weighted_consensus(self):
+        """Build consensus with ML-weighted voting"""
+        print("\n⚖️ Building ML-Weighted Consensus...")
+        print("=" * 60)
+
+        # Calculate weights based on credibility and quality
+        weights = []
+        for analysis in self.article_analyses:
+            weight = analysis['credibility_score'] / 10  # Normalize to 0-1
+
+            # Reduce weight for high bias
+            total_bias = sum(analysis['bias_scores'].values())
+            weight *= (1 - min(total_bias * 0.1, 0.5))  # Max 50% reduction
+
+            weights.append(weight)
+
+        # Normalize weights
+        total_weight = sum(weights)
+        if total_weight > 0:
+            weights = [w / total_weight for w in weights]
+        else:
+            weights = [1 / len(weights) for _ in weights]
+
+        # Weighted voting for winner
+        winner_votes = {}
+
+        for i, analysis in enumerate(self.article_analyses):
+            # Use ML prediction if pattern matching failed
+            if analysis['predictions']['winner']:
+                winner = analysis['predictions']['winner']
+            elif 'implicit_predictions' in analysis['predictions']:
+                winner = analysis['predictions']['implicit_predictions']['ml_winner']
+            else:
+                continue
+
+            if winner not in winner_votes:
+                winner_votes[winner] = 0
+
+            winner_votes[winner] += weights[i]
+
+        # Build consensus
+        self.consensus_data = {
+            'match': f"{self.home_team} vs {self.away_team}",
+            'date': self.match_date,
+            'sources_analyzed': len(self.article_analyses),
+            'ml_enhanced': True
+        }
+
+        # Winner consensus
+        if winner_votes:
+            sorted_winners = sorted(winner_votes.items(), key=lambda x: x[1], reverse=True)
+            total_votes = sum(winner_votes.values())
+
+            self.consensus_data['winner'] = {
+                'prediction': sorted_winners[0][0],
+                'weighted_score': sorted_winners[0][1],
+                'confidence': f"{(sorted_winners[0][1] / total_votes * 100):.1f}%",
+                'all_predictions': dict(sorted_winners)
+            }
+
+        # Quality metrics
+        self.consensus_data['quality_metrics'] = {
+            'avg_credibility': np.mean([a['credibility_score'] for a in self.article_analyses]),
+            'avg_reasoning_quality': np.mean([a['predictions']['reasoning_quality'] for a in self.article_analyses]),
+            'high_quality_sources': sum(1 for a in self.article_analyses if a['credibility_score'] > 7),
+            'low_quality_sources': sum(1 for a in self.article_analyses if a['credibility_score'] < 3)
+        }
+
+        # Bias summary
+        all_biases = {
+            'promotional': [],
+            'recency': [],
+            'favorite': [],
+            'affiliate': []
+        }
+
+        for analysis in self.article_analyses:
+            for bias_type, score in analysis['bias_scores'].items():
+                if score > 0:
+                    all_biases[bias_type.replace('_bias', '')].append({
+                        'domain': analysis['domain'],
+                        'score': score
+                    })
+
+        self.consensus_data['bias_summary'] = all_biases
+
+        print(
+            f"\n📊 Weighted Winner: {self.consensus_data['winner']['prediction']} ({self.consensus_data['winner']['confidence']})")
+        print(f"📈 Average Credibility: {self.consensus_data['quality_metrics']['avg_credibility']:.1f}/10")
+        print(f"🎯 High Quality Sources: {self.consensus_data['quality_metrics']['high_quality_sources']}")
+        print(f"⚠️ Low Quality Sources: {self.consensus_data['quality_metrics']['low_quality_sources']}")
+
+    def generate_ml_report(self):
+        """Generate comprehensive ML-enhanced report"""
+        report = f"""
+{'=' * 80}
+🤖 ML-ENHANCED MATCH PREDICTION REPORT
+{'=' * 80}
+Match: {self.consensus_data['match']}
+Date: {self.consensus_data['date']}
+Sources Analyzed: {self.consensus_data['sources_analyzed']}
+Analysis Type: Machine Learning Enhanced
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+{'=' * 80}
+📊 WINNER PREDICTION (ML-WEIGHTED)
+{'=' * 80}
+Prediction: {self.consensus_data['winner']['prediction']}
+Confidence: {self.consensus_data['winner']['confidence']}
+Weighted Score: {self.consensus_data['winner']['weighted_score']:.3f}
+
+All Predictions (weighted):"""
+
+        for team, score in self.consensus_data['winner']['all_predictions'].items():
+            report += f"\n  • {team}: {score:.3f}"
+
+        # Quality Analysis
+        metrics = self.consensus_data['quality_metrics']
+        report += f"""
+
+{'=' * 80}
+📈 SOURCE QUALITY ANALYSIS
+{'=' * 80}
+Average Credibility Score: {metrics['avg_credibility']:.1f}/10
+Average Reasoning Quality: {metrics['avg_reasoning_quality']:.1f}/10
+High Quality Sources (7+): {metrics['high_quality_sources']}
+Low Quality Sources (<3): {metrics['low_quality_sources']}
+
+Individual Source Ratings:"""
+
+        # Sort by credibility
+        sorted_analyses = sorted(self.article_analyses,
+                                 key=lambda x: x['credibility_score'],
+                                 reverse=True)
+
+        for analysis in sorted_analyses[:5]:  # Top 5
+            report += f"\n  • {analysis['domain']}: {analysis['credibility_score']:.1f}/10"
+            if analysis['credibility_score'] < 5:
+                report += " ⚠️"
+
+        # Bias Analysis
+        report += f"""
+
+{'=' * 80}
+⚖️ BIAS DETECTION RESULTS
+{'=' * 80}"""
+
+        bias_summary = self.consensus_data['bias_summary']
+
+        for bias_type, instances in bias_summary.items():
+            if instances:
+                report += f"\n{bias_type.title()} Bias Detected:"
+                for instance in instances[:3]:  # Top 3
+                    report += f"\n  • {instance['domain']} (score: {instance['score']:.2f})"
+
+        # ML Insights
+        report += f"""
+
+{'=' * 80}
+🧠 ML-SPECIFIC INSIGHTS
+{'=' * 80}"""
+
+        # Confidence distribution
+        high_conf = sum(1 for a in self.article_analyses
+                        if a['predictions'].get('confidence_phrases', {}).get('high', 0) > 0)
+        low_conf = sum(1 for a in self.article_analyses
+                       if a['predictions'].get('confidence_phrases', {}).get('low', 0) > 0)
+
+        report += f"""
+Confidence Language Analysis:
+  • High confidence expressions: {high_conf} articles
+  • Low confidence expressions: {low_conf} articles
+  • Mixed signals detected: {'Yes' if high_conf > 0 and low_conf > 0 else 'No'}
+
+Statistical Evidence:
+  • Articles with statistics: {sum(1 for a in self.article_analyses if a['predictions']['reasoning_quality'] > 3)}
+  • Articles with tactical analysis: {sum(1 for a in self.article_analyses if a['predictions']['reasoning_quality'] > 5)}
+  • Opinion-only articles: {sum(1 for a in self.article_analyses if a['predictions']['reasoning_quality'] < 2)}
+"""
+
+        # Recommendations
+        report += f"""
+
+{'=' * 80}
+💡 ML-ENHANCED RECOMMENDATIONS
+{'=' * 80}
+
+1. TRUST LEVEL: """
+
+        if metrics['avg_credibility'] > 7:
+            report += "HIGH - Sources are generally credible with good reasoning"
+        elif metrics['avg_credibility'] > 5:
+            report += "MEDIUM - Mixed quality sources, consider carefully"
+        else:
+            report += "LOW - Many low-quality or biased sources detected"
+
+        report += f"""
+
+2. CONSENSUS STRENGTH: """
+
+        winner_conf = float(self.consensus_data['winner']['confidence'].rstrip('%'))
+        if winner_conf > 80:
+            report += "STRONG - Clear agreement across sources"
+        elif winner_conf > 60:
+            report += "MODERATE - Reasonable agreement"
+        else:
+            report += "WEAK - Limited consensus"
+
+        report += f"""
+
+3. RED FLAGS:"""
+
+        red_flags = []
+
+        if sum(len(instances) for instances in bias_summary.values()) > 5:
+            red_flags.append("High bias detected across multiple sources")
+
+        if metrics['low_quality_sources'] > metrics['high_quality_sources']:
+            red_flags.append("More low-quality sources than high-quality")
+
+        if high_conf > 0 and low_conf > 0:
+            red_flags.append("Conflicting confidence signals")
+
+        if red_flags:
+            for flag in red_flags:
+                report += f"\n  ⚠️ {flag}"
+        else:
+            report += "\n  ✅ No major red flags detected"
+
+        report += f"""
+
+{'=' * 80}
+📝 METHODOLOGY NOTE
+{'=' * 80}
+This report uses advanced ML techniques including:
+- BERT-based sentiment analysis
+- Zero-shot classification for implicit predictions
+- TF-IDF similarity detection for duplicate content
+- Multi-factor credibility scoring
+- Weighted consensus building based on source quality
+
+⚠️ DISCLAIMER: This is an experimental ML analysis. Always verify
+   predictions with your own research and gamble responsibly.
+{'=' * 80}
+"""
+
+        return report
+
+    def save_ml_analysis(self):
+        """Save detailed ML analysis to JSON"""
+        analysis_data = {
+            'match_info': {
+                'home_team': self.home_team,
+                'away_team': self.away_team,
+                'date': self.match_date
+            },
+            'consensus': self.consensus_data,
+            'individual_analyses': []
+        }
+
+        for analysis in self.article_analyses:
+            analysis_data['individual_analyses'].append({
+                'url': analysis['url'],
+                'domain': analysis['domain'],
+                'credibility_score': analysis['credibility_score'],
+                'predictions': analysis['predictions'],
+                'bias_scores': analysis['bias_scores']
+            })
+
+        filename = f"ML_Analysis_{self.home_team}_vs_{self.away_team}_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+
+        with open(filename, 'w') as f:
+            json.dump(analysis_data, f, indent=2, default=str)
+
+        print(f"\n💾 Detailed ML analysis saved to: {filename}")
+
+        return filename
+
+    def run_complete_ml_analysis(self):
+        """Run the complete ML-enhanced analysis pipeline"""
+        print("\n" + "=" * 80)
+        print("🚀 STARTING ML-ENHANCED MATCH PREDICTION ANALYSIS")
+        print("=" * 80)
+        print(f"Match: {self.home_team} vs {self.away_team}")
+        print(f"Date: {self.match_date}")
+        print(f"Articles to analyze: {len(self.article_urls)}")
+
+        # Step 1: Analyze all articles with ML
+        duplicates = self.analyze_all_articles_ml()
+
+        if not self.article_analyses:
+            print("\n❌ No articles could be analyzed")
+            return None
+
+        # Step 2: Build weighted consensus
+        self.build_weighted_consensus()
+
+        # Step 3: Generate report
+        report = self.generate_ml_report()
+
+        # Step 4: Save analysis
+        json_file = self.save_ml_analysis()
+
+        # Step 5: Save report
+        report_filename = f"ML_Report_{self.home_team}_vs_{self.away_team}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+        with open(report_filename, 'w', encoding='utf-8') as f:
+            f.write(report)
+
+        print(f"📄 Report saved to: {report_filename}")
+
+        return report, json_file
+
+
+class RiskAssessmentMLPredictor(MLEnhancedMatchPredictor):
+    """
+    Extended ML Predictor with Risk Assessment for betting markets
+    """
+
+    def __init__(self, match_info):
+        super().__init__(match_info)
+        self.market_predictions = defaultdict(dict)
+        self.risk_assessments = {}
+
+    def extract_market_predictions(self, text):
+        """Extract predictions for all betting markets"""
+        predictions = {
+            'over_under': {},
+            'btts': None,
+            'corners': {},
+            'cards': {},
+            'moneyline': None,
+            'spread': {},
+            'clean_sheet': {},
+            'goal_scorers': [],
+            'halftime': {}
+        }
+
+        # Over/Under Goals
+        for threshold in ['0.5', '1.5', '2.5', '3.5', '4.5']:
+            # Over patterns
+            over_patterns = [
+                rf'over\s+{threshold}(?:\s+goals?)?',
+                rf'more\s+than\s+{threshold}(?:\s+goals?)?',
+                rf'(?:expect|predict).*?(?:at\s+least|minimum)\s+{int(float(threshold) + 0.5)}(?:\s+goals?)?'
+            ]
+
+            # Under patterns
+            under_patterns = [
+                rf'under\s+{threshold}(?:\s+goals?)?',
+                rf'(?:less|fewer)\s+than\s+{threshold}(?:\s+goals?)?',
+                rf'(?:expect|predict).*?(?:maximum|at\s+most)\s+{int(float(threshold))}(?:\s+goals?)?'
+            ]
+
+            for pattern in over_patterns:
+                if re.search(pattern, text, re.IGNORECASE):
+                    predictions['over_under'][threshold] = 'Over'
+                    break
+
+            for pattern in under_patterns:
+                if re.search(pattern, text, re.IGNORECASE):
+                    predictions['over_under'][threshold] = 'Under'
+                    break
+
+        # BTTS (Both Teams to Score)
+        btts_yes_patterns = [
+            r'both\s+teams?\s+(?:to\s+)?score.*?(?:yes|likely|expect)',
+            r'BTTS.*?(?:yes|likely)',
+            r'(?:expect|predict).*?both.*?(?:score|goal)',
+            r'open\s+game.*?goals\s+(?:from|at)\s+both\s+ends'
+        ]
+
+        btts_no_patterns = [
+            r'both\s+teams?\s+(?:to\s+)?score.*?(?:no|unlikely)',
+            r'BTTS.*?(?:no|unlikely)',
+            r'clean\s+sheet',
+            r'(?:one|1)\s+team\s+(?:to\s+)?(?:dominate|score)'
+        ]
+
+        for pattern in btts_yes_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                predictions['btts'] = 'Yes'
+                break
+
+        for pattern in btts_no_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                predictions['btts'] = 'No'
+                break
+
+        # Corners
+        corner_patterns = [
+            r'(?:over|under)\s+(\d+\.?\d*)\s+corners',
+            r'(\d+)\+?\s+corners',
+            r'corners.*?(?:over|under)\s+(\d+\.?\d*)'
+        ]
+
+        for pattern in corner_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                if 'over' in text[max(0, text.find(match[0]) - 20):text.find(match[0]) + 20].lower():
+                    predictions['corners'][match[0]] = 'Over'
+                elif 'under' in text[max(0, text.find(match[0]) - 20):text.find(match[0]) + 20].lower():
+                    predictions['corners'][match[0]] = 'Under'
+
+        # Moneyline/Winner
+        winner_patterns = [
+            (rf'{self.home_team}\s+(?:to |will |should )\s*win', self.home_team),
+            (rf'{self.away_team}\s+(?:to |will |should )\s*win', self.away_team),
+            (rf'back\s+{self.home_team}', self.home_team),
+            (rf'back\s+{self.away_team}', self.away_team),
+            (r'draw|tie|stalemate', 'Draw')
+        ]
+
+        for pattern, team in winner_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                predictions['moneyline'] = team
+                break
+
+        # Spread/Handicap
+        spread_patterns = [
+            rf'{self.home_team}\s+(?:-|\+)(\d+\.?\d*)',
+            rf'{self.away_team}\s+(?:-|\+)(\d+\.?\d*)',
+            r'handicap\s+(?:-|\+)(\d+\.?\d*)'
+        ]
+
+        for pattern in spread_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                if self.home_team in pattern:
+                    predictions['spread']['home'] = match
+                elif self.away_team in pattern:
+                    predictions['spread']['away'] = match
+
+        # Clean sheets
+        clean_sheet_patterns = [
+            (rf'{self.home_team}.*?clean\s+sheet', self.home_team),
+            (rf'{self.away_team}.*?clean\s+sheet', self.away_team),
+            (rf'clean\s+sheet.*?{self.home_team}', self.home_team),
+            (rf'clean\s+sheet.*?{self.away_team}', self.away_team)
+        ]
+
+        for pattern, team in clean_sheet_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                predictions['clean_sheet'][team] = True
+
+        return predictions
+
+    def aggregate_market_predictions(self):
+        """Aggregate predictions across all sources for each market"""
+        market_aggregates = defaultdict(lambda: defaultdict(int))
+
+        for analysis in self.article_analyses:
+            weight = analysis['credibility_score'] / 10  # Use credibility as weight
+
+            # Get extended predictions
+            extended_predictions = self.extract_market_predictions(analysis['content'])
+
+            # Aggregate Over/Under
+            for threshold, prediction in extended_predictions['over_under'].items():
+                market_aggregates['over_under'][f"{threshold}_{prediction}"] += weight
+
+            # Aggregate BTTS
+            if extended_predictions['btts']:
+                market_aggregates['btts'][extended_predictions['btts']] += weight
+
+            # Aggregate Moneyline
+            if extended_predictions['moneyline']:
+                market_aggregates['moneyline'][extended_predictions['moneyline']] += weight
+
+            # Aggregate Corners
+            for corner_line, prediction in extended_predictions['corners'].items():
+                market_aggregates['corners'][f"{corner_line}_{prediction}"] += weight
+
+            # Aggregate Clean Sheets
+            for team, cs in extended_predictions['clean_sheet'].items():
+                if cs:
+                    market_aggregates['clean_sheet'][team] += weight
+
+        return market_aggregates
+
+    def calculate_market_confidence(self, market_aggregates):
+        """Calculate confidence levels for each market prediction"""
+        market_confidence = {}
+
+        for market, predictions in market_aggregates.items():
+            if not predictions:
+                continue
+
+            total_weight = sum(predictions.values())
+            if total_weight == 0:
+                continue
+
+            # Calculate confidence for each option
+            market_confidence[market] = {}
+            for option, weight in predictions.items():
+                confidence = (weight / total_weight) * 100
+                market_confidence[market][option] = {
+                    'confidence': confidence,
+                    'weight': weight,
+                    'sources': int(weight * 10)  # Approximate number of sources
+                }
+
+        return market_confidence
+
+    def assess_risk_levels(self, market_confidence):
+        """Categorize predictions into risk levels"""
+        risk_categories = {
+            'safer': [],  # 70%+ confidence
+            'moderate': [],  # 50-70% confidence
+            'risky': [],  # <50% confidence
+            'avoid': []  # Conflicting or low data
+        }
+
+        # Over/Under Analysis
+        if 'over_under' in market_confidence:
+            for threshold in ['0.5', '1.5', '2.5', '3.5', '4.5']:
+                over_key = f"{threshold}_Over"
+                under_key = f"{threshold}_Under"
+
+                over_conf = market_confidence['over_under'].get(over_key, {}).get('confidence', 0)
+                under_conf = market_confidence['over_under'].get(under_key, {}).get('confidence', 0)
+
+                # Determine dominant prediction
+                if over_conf > under_conf:
+                    prediction = f"Over {threshold}"
+                    confidence = over_conf
+                elif under_conf > over_conf:
+                    prediction = f"Under {threshold}"
+                    confidence = under_conf
+                else:
+                    continue
+
+                # Risk assessment based on confidence and threshold
+                risk_adjustment = self._adjust_risk_for_threshold(threshold, prediction)
+                adjusted_confidence = confidence * risk_adjustment
+
+                entry = {
+                    'market': 'Goals Over/Under',
+                    'prediction': prediction,
+                    'confidence': confidence,
+                    'adjusted_confidence': adjusted_confidence,
+                    'sources': market_confidence['over_under'][over_key if over_conf > under_conf else under_key][
+                        'sources']
+                }
+
+                if adjusted_confidence >= 70:
+                    risk_categories['safer'].append(entry)
+                elif adjusted_confidence >= 50:
+                    risk_categories['moderate'].append(entry)
+                elif adjusted_confidence >= 30:
+                    risk_categories['risky'].append(entry)
+                else:
+                    risk_categories['avoid'].append(entry)
+
+        # BTTS Analysis
+        if 'btts' in market_confidence:
+            yes_conf = market_confidence['btts'].get('Yes', {}).get('confidence', 0)
+            no_conf = market_confidence['btts'].get('No', {}).get('confidence', 0)
+
+            if yes_conf > no_conf:
+                prediction = "BTTS Yes"
+                confidence = yes_conf
+            elif no_conf > yes_conf:
+                prediction = "BTTS No"
+                confidence = no_conf
+            else:
+                prediction = None
+
+            if prediction:
+                entry = {
+                    'market': 'Both Teams to Score',
+                    'prediction': prediction,
+                    'confidence': confidence,
+                    'adjusted_confidence': confidence,
+                    'sources': market_confidence['btts']['Yes' if yes_conf > no_conf else 'No']['sources']
+                }
+
+                if confidence >= 70:
+                    risk_categories['safer'].append(entry)
+                elif confidence >= 50:
+                    risk_categories['moderate'].append(entry)
+                else:
+                    risk_categories['risky'].append(entry)
+
+        # Moneyline Analysis
+        if 'moneyline' in market_confidence:
+            best_prediction = max(market_confidence['moneyline'].items(),
+                                  key=lambda x: x[1]['confidence'])
+
+            entry = {
+                'market': 'Moneyline',
+                'prediction': best_prediction[0],
+                'confidence': best_prediction[1]['confidence'],
+                'adjusted_confidence': best_prediction[1]['confidence'],
+                'sources': best_prediction[1]['sources']
+            }
+
+            if best_prediction[1]['confidence'] >= 75:
+                risk_categories['safer'].append(entry)
+            elif best_prediction[1]['confidence'] >= 55:
+                risk_categories['moderate'].append(entry)
+            else:
+                risk_categories['risky'].append(entry)
+
+        # Corners Analysis
+        if 'corners' in market_confidence and market_confidence['corners']:
+            for corner_pred, data in market_confidence['corners'].items():
+                entry = {
+                    'market': 'Corners',
+                    'prediction': corner_pred.replace('_', ' '),
+                    'confidence': data['confidence'],
+                    'adjusted_confidence': data['confidence'] * 0.8,  # Corners are generally riskier
+                    'sources': data['sources']
+                }
+
+                if data['confidence'] >= 80:
+                    risk_categories['moderate'].append(entry)
+                else:
+                    risk_categories['risky'].append(entry)
+
+        return risk_categories
+
+    def _adjust_risk_for_threshold(self, threshold, prediction):
+        """Adjust risk based on threshold and prediction type"""
+        # Lower thresholds are generally safer for Over, higher for Under
+        adjustments = {
+            '0.5': {'Over': 1.2, 'Under': 0.7},  # Over 0.5 is very safe
+            '1.5': {'Over': 1.1, 'Under': 0.9},  # Over 1.5 is quite safe
+            '2.5': {'Over': 1.0, 'Under': 1.0},  # Neutral
+            '3.5': {'Over': 0.9, 'Under': 1.1},  # Under 3.5 is safer
+            '4.5': {'Over': 0.7, 'Under': 1.2}  # Under 4.5 is very safe
+        }
+
+        prediction_type = 'Over' if 'Over' in prediction else 'Under'
+        return adjustments.get(threshold, {}).get(prediction_type, 1.0)
+
+    def analyze_historical_patterns(self):
+        """Analyze historical patterns mentioned in articles"""
+        historical_insights = {
+            'h2h_mentioned': 0,
+            'recent_form': 0,
+            'scoring_patterns': [],
+            'defensive_records': []
+        }
+
+        for analysis in self.article_analyses:
+            content = analysis['content'].lower()
+
+            # Check for H2H mentions
+            if re.search(r'head\s*to\s*head|h2h|previous\s+meetings?|last\s+\d+\s+meetings?', content):
+                historical_insights['h2h_mentioned'] += 1
+
+            # Check for recent form
+            if re.search(r'last\s+\d+\s+(?:games?|matches?)|recent\s+form|current\s+form', content):
+                historical_insights['recent_form'] += 1
+
+            # Extract scoring patterns
+            scoring_patterns = re.findall(r'(?:scored|conceded)\s+(\d+)\s+goals?\s+in\s+(?:last\s+)?(\d+)', content)
+            historical_insights['scoring_patterns'].extend(scoring_patterns)
+
+            # Extract defensive records
+            clean_sheet_mentions = re.findall(r'(\d+)\s+clean\s+sheets?\s+in\s+(?:last\s+)?(\d+)', content)
+            historical_insights['defensive_records'].extend(clean_sheet_mentions)
+
+        return historical_insights
+
+    def generate_risk_assessment_report(self, risk_categories, market_confidence):
+        """Generate comprehensive risk assessment report"""
+        report = f"""
+{'=' * 80}
+🎯 RISK ASSESSMENT REPORT - BETTING MARKETS ANALYSIS
+{'=' * 80}
+Match: {self.consensus_data['match']}
+Date: {self.consensus_data['date']}
+Sources Analyzed: {self.consensus_data['sources_analyzed']}
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+{'=' * 80}
+✅ SAFER BETS (70%+ Confidence)
+{'=' * 80}"""
+
+        if risk_categories['safer']:
+            for bet in sorted(risk_categories['safer'], key=lambda x: x['confidence'], reverse=True):
+                report += f"""
+• {bet['market']}: {bet['prediction']}
+  Confidence: {bet['confidence']:.1f}%
+  Sources: {bet['sources']} articles
+  Risk Level: LOW"""
+                if bet['confidence'] >= 80:
+                    report += " ⭐"
+                report += "\n"
+        else:
+            report += "\nNo high-confidence predictions found.\n"
+
+        report += f"""
+{'=' * 80}
+⚡ MODERATE RISK (50-70% Confidence)
+{'=' * 80}"""
+
+        if risk_categories['moderate']:
+            for bet in sorted(risk_categories['moderate'], key=lambda x: x['confidence'], reverse=True):
+                report += f"""
+• {bet['market']}: {bet['prediction']}
+  Confidence: {bet['confidence']:.1f}%
+  Sources: {bet['sources']} articles
+  Risk Level: MODERATE
+"""
+        else:
+            report += "\nNo moderate-confidence predictions found.\n"
+
+        report += f"""
+{'=' * 80}
+⚠️  RISKY BETS (<50% Confidence)
+{'=' * 80}"""
+
+        if risk_categories['risky']:
+            for bet in sorted(risk_categories['risky'], key=lambda x: x['confidence'], reverse=True):
+                report += f"""
+• {bet['market']}: {bet['prediction']}
+  Confidence: {bet['confidence']:.1f}%
+  Sources: {bet['sources']} articles
+  Risk Level: HIGH ⚠️
+"""
+        else:
+            report += "\nNo risky predictions identified.\n"
+
+        # Market Analysis Summary
+        report += f"""
+{'=' * 80}
+📊 DETAILED MARKET ANALYSIS
+{'=' * 80}
+
+1. GOALS OVER/UNDER ANALYSIS:"""
+
+        if 'over_under' in market_confidence:
+            for threshold in ['0.5', '1.5', '2.5', '3.5', '4.5']:
+                over_key = f"{threshold}_Over"
+                under_key = f"{threshold}_Under"
+
+                over_data = market_confidence['over_under'].get(over_key, {})
+                under_data = market_confidence['over_under'].get(under_key, {})
+
+                if over_data or under_data:
+                    report += f"\n   {threshold} Goals:"
+                    if over_data:
+                        report += f"\n     - Over: {over_data.get('confidence', 0):.1f}% ({over_data.get('sources', 0)} sources)"
+                    if under_data:
+                        report += f"\n     - Under: {under_data.get('confidence', 0):.1f}% ({under_data.get('sources', 0)} sources)"
+
+        report += f"\n\n2. BOTH TEAMS TO SCORE:"
+        if 'btts' in market_confidence:
+            for option, data in market_confidence['btts'].items():
+                report += f"\n   - {option}: {data['confidence']:.1f}% ({data['sources']} sources)"
+        else:
+            report += "\n   No BTTS predictions found"
+
+        report += f"\n\n3. MONEYLINE/WINNER:"
+        if 'moneyline' in market_confidence:
+            for team, data in sorted(market_confidence['moneyline'].items(),
+                                     key=lambda x: x[1]['confidence'], reverse=True):
+                report += f"\n   - {team}: {data['confidence']:.1f}% ({data['sources']} sources)"
+
+        # Historical Insights
+        historical = self.analyze_historical_patterns()
+        report += f"""
+
+{'=' * 80}
+📈 HISTORICAL CONTEXT
+{'=' * 80}
+H2H Analysis Mentioned: {historical['h2h_mentioned']} articles
+Recent Form Discussed: {historical['recent_form']} articles
+"""
+
+        # Smart Betting Combinations
+        report += f"""
+{'=' * 80}
+🎲 RECOMMENDED BETTING STRATEGIES
+{'=' * 80}
+
+Based on the analysis, here are suggested betting approaches:
+
+1. CONSERVATIVE STRATEGY (Lower Risk):"""
+
+        if risk_categories['safer']:
+            report += "\n   Combine these safer bets:"
+            for bet in risk_categories['safer'][:3]:
+                report += f"\n   • {bet['prediction']}"
+        else:
+            report += "\n   • No high-confidence bets available"
+
+        report += "\n\n2. BALANCED STRATEGY (Medium Risk):"
+        if risk_categories['safer'] and risk_categories['moderate']:
+            report += "\n   Mix one safe bet with moderate options:"
+            if risk_categories['safer']:
+                report += f"\n   • {risk_categories['safer'][0]['prediction']} (Safe)"
+            if risk_categories['moderate']:
+                report += f"\n   • {risk_categories['moderate'][0]['prediction']} (Moderate)"
+
+        report += "\n\n3. VALUE HUNTING (Higher Risk):"
+        report += "\n   Look for value in less popular markets"
+
+        # Warnings
+        report += f"""
+
+{'=' * 80}
+⚠️  IMPORTANT WARNINGS
+{'=' * 80}
+• Confidence levels are based on article consensus, not guaranteed outcomes
+• Always consider your bankroll management strategy
+• Past performance doesn't guarantee future results
+• Odds and value should be considered alongside these predictions
+• This analysis is for informational purposes only
+
+{'=' * 80}
+💡 KEY INSIGHTS
+{'=' * 80}"""
+
+        # Generate key insights
+        total_markets = sum(len(cat) for cat in risk_categories.values())
+        safe_percentage = (len(risk_categories['safer']) / total_markets * 100) if total_markets > 0 else 0
+
+        report += f"""
+• Total betting opportunities identified: {total_markets}
+• High-confidence predictions: {len(risk_categories['safer'])} ({safe_percentage:.0f}%)
+• Most analyzed market: Goals Over/Under
+• Consensus strength: {'Strong' if safe_percentage > 30 else 'Moderate' if safe_percentage > 15 else 'Weak'}
+
+🏁 FINAL RECOMMENDATION:
+"""
+
+        if risk_categories['safer']:
+            safest_bet = risk_categories['safer'][0]
+            report += f"The safest bet appears to be {safest_bet['prediction']} with {safest_bet['confidence']:.1f}% confidence."
+        else:
+            report += "No high-confidence bets identified. Consider avoiding this match or betting very conservatively."
+
+        report += "\n" + "=" * 80
+
+        return report
+
+    def run_complete_risk_analysis(self):
+        """Run the complete risk assessment analysis"""
+        print("\n" + "=" * 80)
+        print("🎯 STARTING RISK ASSESSMENT ANALYSIS")
+        print("=" * 80)
+
+        # First run the ML analysis
+        duplicates = self.analyze_all_articles_ml()
+
+        if not self.article_analyses:
+            print("\n❌ No articles could be analyzed")
+            return None
+
+        # Build consensus
+        self.build_weighted_consensus()
+
+        # Aggregate market predictions
+        print("\n📊 Aggregating market predictions...")
+        market_aggregates = self.aggregate_market_predictions()
+
+        # Calculate confidence levels
+        market_confidence = self.calculate_market_confidence(market_aggregates)
+
+        # Assess risk levels
+        print("🎲 Assessing risk levels...")
+        risk_categories = self.assess_risk_levels(market_confidence)
+
+        # Generate reports
+        ml_report = self.generate_ml_report()
+        risk_report = self.generate_risk_assessment_report(risk_categories, market_confidence)
+
+        # Save everything
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+
+        # Save risk analysis
+        risk_data = {
+            'match_info': {
+                'home_team': self.home_team,
+                'away_team': self.away_team,
+                'date': self.match_date
+            },
+            'risk_categories': risk_categories,
+            'market_confidence': market_confidence,
+            'market_aggregates': {k: dict(v) for k, v in market_aggregates.items()}
+        }
+
+        risk_filename = f"Risk_Analysis_{self.home_team}_vs_{self.away_team}_{timestamp}.json"
+        with open(risk_filename, 'w') as f:
+            json.dump(risk_data, f, indent=2, default=str)
+
+        print(f"\n💾 Risk analysis data saved to: {risk_filename}")
+
+        # Save combined report
+        combined_report = ml_report + "\n\n" + risk_report
+        report_filename = f"Complete_Analysis_{self.home_team}_vs_{self.away_team}_{timestamp}.txt"
+        with open(report_filename, 'w', encoding='utf-8') as f:
+            f.write(combined_report)
+
+        print(f"📄 Complete report saved to: {report_filename}")
+
+        # Print risk summary
+        print("\n" + risk_report)
+
+        return risk_report, risk_data
+
+
+# Quick analysis function
+def analyze_match_with_risk_assessment(home_team, away_team, match_date, urls):
+    """
+    Run complete ML analysis with risk assessment
+    """
+    match_info = {
+        'home_team': home_team,
+        'away_team': away_team,
+        'match_date': match_date,
+        'urls': urls
+    }
+
+    predictor = RiskAssessmentMLPredictor(match_info)
+    risk_report, risk_data = predictor.run_complete_risk_analysis()
+
+    return risk_report, risk_data
+
+
+# Example usage
+if __name__ == "__main__":
+    # Example match
+    match_info = {
+        'home_team': 'Rapids',
+        'away_team': 'Galaxy',
+        'match_date': '2025-06-25',
+        'urls': [
+            "https://www.sportsgambler.com/betting-tips/football/colorado-rapids-vs-la-galaxy-prediction-lineups-odds-2025-06-25/",
+            "https://www.sportsmole.co.uk/football/colorado-rapids/preview/colorado-vs-la-galaxy-prediction-team-news-lineups_576032.html",
+            "https://www.dimers.com/news/colorado-rapids-vs-la-galaxy-prediction-mls-ac-6-25-25",
+            "https://pickdawgz.com/mls-picks/colorado-rapids-vs-los-angeles-galaxy-prediction-06-25-2025-picks/",
+            "https://footballwhispers.com/blog/colorado-rapids-vs-los-angeles-galaxy-prediction/",
+            "https://scores24.live/en/soccer/m-26-06-2025-colorado-rapids-los-angeles-galaxy-prediction",
+            "https://www.sportskeeda.com/football/colorado-rapids-vs-la-galaxy-prediction-betting-tips-june-25-2025",
+            "https://www.docsports.com/free-picks/soccer/2025/colorado-rapids-vs-la-galaxy-prediction-6-25-2025-soccer-pick-tips-and-odds.html",
+            "https://www.footboom1.com/en/news/football/2629903-colorado-rapids-los-angeles-galaxy-match-preview-and-prediction",
+            "https://777score.com/news/football/2629899-colorado-rapids-los-angeles-galaxy-match-preview-and-prediction",
+            "https://www.sportytrader.com/us/picks/colorado-rapids-la-galaxy-274163/",
+
+            # Add more URLs as needed
+        ]
+    }
+
+    # Run risk assessment
+    predictor = RiskAssessmentMLPredictor(match_info)
+    risk_report, risk_data = predictor.run_complete_risk_analysis()
