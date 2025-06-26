@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""
+Robust Match Analyzer for LAFC vs Flamengo
+Handles web scraping failures gracefully and provides analysis
+"""
+
+import requests
+from bs4 import BeautifulSoup
+import re
+from collections import Counter, defaultdict
+import json
+from datetime import datetime
+import time
+from urllib.parse import urlparse
+import ssl
+import certifi
+
+
+class RobustMatchAnalyzer:
+    def __init__(self, home_team, away_team, match_date, urls):
+        self.home_team = home_team
+        self.away_team = away_team
+        self.match_date = match_date
+        self.urls = urls
+        self.successful_scrapes = []
+        self.failed_scrapes = []
+        self.all_predictions = []
+
+    def fetch_with_fallback(self, url):
+        """Try multiple strategies to fetch content"""
+        strategies = [
+            self._fetch_standard,
+            self._fetch_with_different_headers,
+            self._fetch_with_minimal_headers
+        ]
+
+        for strategy in strategies:
+            result = strategy(url)
+            if result and result.get('content'):
+                return result
+
+        return {'url': url, 'domain': urlparse(url).netloc, 'content': '', 'error': 'All strategies failed'}
+
+    def _fetch_standard(self, url):
+        """Standard fetch with full headers"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            }
+
+            response = requests.get(url, headers=headers, timeout=15, verify=False)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            # Remove unwanted elements
+            for element in soup(['script', 'style', 'meta', 'noscript']):
+                element.decompose()
+
+            # Extract text
+            text = soup.get_text(separator=' ', strip=True)
+
+            # Clean text
+            text = re.sub(r'\s+', ' ', text)
+            text = re.sub(r'[^\x00-\x7F]+', ' ', text)  # Remove non-ASCII
+
+            return {
+                'url': url,
+                'domain': urlparse(url).netloc,
+                'content': text[:15000],
+                'method': 'standard'
+            }
+        except:
+            return None
+
+    def _fetch_with_different_headers(self, url):
+        """Try with mobile headers"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1'
+            }
+
+            response = requests.get(url, headers=headers, timeout=10, verify=False)
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            text = soup.get_text(separator=' ', strip=True)
+            text = re.sub(r'\s+', ' ', text)
+
+            return {
+                'url': url,
+                'domain': urlparse(url).netloc,
+                'content': text[:15000],
+                'method': 'mobile'
+            }
+        except:
+            return None
+
+    def _fetch_with_minimal_headers(self, url):
+        """Minimal approach"""
+        try:
+            response = requests.get(url, timeout=10, verify=False)
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            text = soup.get_text(separator=' ', strip=True)
+            text = re.sub(r'\s+', ' ', text)
+
+            return {
+                'url': url,
+                'domain': urlparse(url).netloc,
+                'content': text[:15000],
+                'method': 'minimal'
+            }
+        except:
+            return None
+
+    def extract_predictions(self, text, source):
+        """Extract all predictions from text"""
+        predictions = {
+            'source': source,
+            'winner': None,
+            'score': None,
+            'over_under': {},
+            'btts': None,
+            'corners': None,
+            'confidence_indicators': []
+        }
+
+        text_lower = text.lower()
+
+        # Winner prediction - improved patterns
+        winner_patterns = [
+            (rf'{self.home_team.lower()}\s+(?:to\s+)?(?:win|victory|triumph)', self.home_team),
+            (rf'{self.away_team.lower()}\s+(?:to\s+)?(?:win|victory|triumph)', self.away_team),
+            (rf'(?:predict|tip|back)\s+{self.home_team.lower()}', self.home_team),
+            (rf'(?:predict|tip|back)\s+{self.away_team.lower()}', self.away_team),
+            (rf'{self.home_team.lower()}\s+(?:are|is)\s+favo(?:u)?red', self.home_team),
+            (rf'{self.away_team.lower()}\s+(?:are|is)\s+favo(?:u)?red', self.away_team),
+            (r'(?:draw|tie|stalemate|share.*?points)', 'Draw')
+        ]
+
+        for pattern, team in winner_patterns:
+            if re.search(pattern, text_lower):
+                predictions['winner'] = team
+                break
+
+        # Score predictions
+        score_patterns = [
+            rf'{self.home_team}.*?(\d+)\s*[-–:]\s*(\d+).*?{self.away_team}',
+            rf'{self.away_team}.*?(\d+)\s*[-–:]\s*(\d+).*?{self.home_team}',
+            r'(?:predict|forecast|final\s+score).*?(\d+)\s*[-–:]\s*(\d+)',
+            r'(\d+)\s*[-–:]\s*(\d+)\s+(?:victory|win|final)'
+        ]
+
+        for pattern in score_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                try:
+                    h, a = int(match[0]), int(match[1])
+                    if h < 10 and a < 10:  # Reasonable scores
+                        predictions['score'] = f"{h}-{a}"
+                        break
+                except:
+                    continue
+            if predictions['score']:
+                break
+
+        # Over/Under extraction
+        for threshold in ['0.5', '1.5', '2.5', '3.5', '4.5']:
+            if re.search(rf'over\s+{threshold}(?:\s+goals?)?', text_lower):
+                predictions['over_under'][threshold] = 'Over'
+            elif re.search(rf'under\s+{threshold}(?:\s+goals?)?', text_lower):
+                predictions['over_under'][threshold] = 'Under'
+
+        # BTTS
+        btts_patterns = [
+            (r'both\s+teams?\s+(?:to\s+)?score.*?(?:yes|likely|expect)', 'Yes'),
+            (r'both\s+teams?\s+(?:to\s+)?score.*?(?:no|unlikely)', 'No'),
+            (r'btts.*?yes', 'Yes'),
+            (r'btts.*?no', 'No')
+        ]
+
+        for pattern, result in btts_patterns:
+            if re.search(pattern, text_lower):
+                predictions['btts'] = result
+                break
+
+        # Corners
+        corner_match = re.search(r'(?:over|under)\s+(\d+\.?\d*)\s+corners?', text_lower)
+        if corner_match:
+            predictions['corners'] = corner_match.group(0)
+
+        # Confidence indicators
+        high_conf = ['will definitely', 'certainly', 'surely', 'guaranteed', 'confident']
+        med_conf = ['should', 'likely', 'probably', 'expected', 'favored']
+        low_conf = ['might', 'could', 'possibly', 'perhaps', 'maybe']
+
+        for phrase in high_conf:
+            if phrase in text_lower:
+                predictions['confidence_indicators'].append(('high', phrase))
+
+        for phrase in med_conf:
+            if phrase in text_lower:
+                predictions['confidence_indicators'].append(('medium', phrase))
+
+        for phrase in low_conf:
+            if phrase in text_lower:
+                predictions['confidence_indicators'].append(('low', phrase))
+
+        return predictions
+
+    def analyze_all_urls(self):
+        """Analyze all URLs with fallback handling"""
+        print(f"\n🚀 Analyzing {len(self.urls)} articles for {self.home_team} vs {self.away_team}")
+        print("=" * 70)
+
+        for i, url in enumerate(self.urls, 1):
+            domain = urlparse(url).netloc
+            print(f"\n📰 [{i}/{len(self.urls)}] {domain}")
+
+            # Try to fetch
+            result = self.fetch_with_fallback(url)
+
+            if result.get('content'):
+                print(f"  ✅ Success! ({len(result['content'])} chars via {result.get('method', 'unknown')})")
+                self.successful_scrapes.append(result)
+
+                # Extract predictions
+                predictions = self.extract_predictions(result['content'], domain)
+                self.all_predictions.append(predictions)
+
+                # Show what we found
+                if predictions['winner']:
+                    print(f"  🏆 Winner: {predictions['winner']}")
+                if predictions['score']:
+                    print(f"  📊 Score: {predictions['score']}")
+                if predictions['over_under']:
+                    print(f"  📈 O/U: {predictions['over_under']}")
+                if predictions['btts']:
+                    print(f"  ⚽ BTTS: {predictions['btts']}")
+            else:
+                print(f"  ❌ Failed to fetch")
+                self.failed_scrapes.append(url)
+
+            time.sleep(1)  # Be polite
+
+        success_rate = len(self.successful_scrapes) / len(self.urls) * 100
+        print(f"\n📊 Success rate: {len(self.successful_scrapes)}/{len(self.urls)} ({success_rate:.0f}%)")
+
+    def build_consensus(self):
+        """Build consensus from all predictions"""
+        if not self.all_predictions:
+            return None
+
+        consensus = {
+            'match': f"{self.home_team} vs {self.away_team}",
+            'date': self.match_date,
+            'sources_analyzed': len(self.successful_scrapes),
+            'success_rate': f"{len(self.successful_scrapes)}/{len(self.urls)}"
+        }
+
+        # Winner consensus
+        winners = [p['winner'] for p in self.all_predictions if p['winner']]
+        if winners:
+            winner_counts = Counter(winners)
+            total = len(winners)
+            most_common = winner_counts.most_common(1)[0]
+
+            consensus['winner'] = {
+                'prediction': most_common[0],
+                'votes': f"{most_common[1]}/{total}",
+                'confidence': f"{(most_common[1] / total * 100):.0f}%",
+                'all_predictions': dict(winner_counts)
+            }
+
+        # Score consensus
+        scores = [p['score'] for p in self.all_predictions if p['score']]
+        if scores:
+            score_counts = Counter(scores)
+            consensus['scores'] = {
+                'most_common': score_counts.most_common(3),
+                'all_scores': dict(score_counts)
+            }
+
+        # Over/Under consensus
+        ou_votes = defaultdict(lambda: defaultdict(int))
+        for pred in self.all_predictions:
+            for threshold, vote in pred['over_under'].items():
+                ou_votes[threshold][vote] += 1
+
+        consensus['over_under'] = {}
+        for threshold, votes in ou_votes.items():
+            total = sum(votes.values())
+            if total > 0:
+                if votes['Over'] > votes['Under']:
+                    rec = 'Over'
+                    conf = votes['Over'] / total * 100
+                else:
+                    rec = 'Under'
+                    conf = votes['Under'] / total * 100
+
+                consensus['over_under'][threshold] = {
+                    'recommendation': f"{rec} {threshold}",
+                    'confidence': f"{conf:.0f}%",
+                    'votes': f"Over: {votes['Over']}, Under: {votes['Under']}"
+                }
+
+        # BTTS consensus
+        btts_votes = [p['btts'] for p in self.all_predictions if p['btts']]
+        if btts_votes:
+            btts_counts = Counter(btts_votes)
+            total = len(btts_votes)
+            most_common = btts_counts.most_common(1)[0]
+
+            consensus['btts'] = {
+                'prediction': most_common[0],
+                'confidence': f"{(most_common[1] / total * 100):.0f}%",
+                'votes': dict(btts_counts)
+            }
+
+        # Confidence assessment
+        all_confidence = []
+        for pred in self.all_predictions:
+            if pred['confidence_indicators']:
+                levels = [ind[0] for ind in pred['confidence_indicators']]
+                if 'high' in levels:
+                    all_confidence.append('high')
+                elif 'medium' in levels:
+                    all_confidence.append('medium')
+                else:
+                    all_confidence.append('low')
+
+        if all_confidence:
+            conf_counts = Counter(all_confidence)
+            consensus['overall_confidence'] = conf_counts.most_common(1)[0][0].upper()
+
+        return consensus
+
+    def generate_report(self):
+        """Generate comprehensive betting report"""
+        consensus = self.build_consensus()
+
+        if not consensus:
+            return "No data available for analysis"
+
+        report = f"""
+{'=' * 80}
+⚽ MATCH PREDICTION REPORT
+{'=' * 80}
+Match: {consensus['match']}
+Date: {consensus['date']}
+Articles Analyzed: {consensus['sources_analyzed']} ({consensus['success_rate']} success rate)
+Overall Confidence: {consensus.get('overall_confidence', 'UNKNOWN')}
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+{'=' * 80}
+🏆 MATCH RESULT PREDICTION
+{'=' * 80}"""
+
+        if 'winner' in consensus:
+            w = consensus['winner']
+            report += f"""
+Prediction: {w['prediction']}
+Confidence: {w['confidence']} ({w['votes']})
+
+All predictions:"""
+            for team, count in w['all_predictions'].items():
+                report += f"\n  • {team}: {count} votes"
+        else:
+            report += "\nNo clear winner prediction found"
+
+        # Score predictions
+        if 'scores' in consensus:
+            report += f"""
+
+{'=' * 80}
+📊 SCORE PREDICTIONS
+{'=' * 80}
+Most common predictions:"""
+            for score, count in consensus['scores']['most_common']:
+                report += f"\n  • {score}: {count} mentions"
+
+        # Over/Under
+        report += f"""
+
+{'=' * 80}
+📈 OVER/UNDER ANALYSIS
+{'=' * 80}"""
+
+        if consensus['over_under']:
+            report += "\nThreshold    Recommendation    Confidence    Votes\n"
+            report += "-" * 60 + "\n"
+
+            for threshold in ['0.5', '1.5', '2.5', '3.5', '4.5']:
+                if threshold in consensus['over_under']:
+                    data = consensus['over_under'][threshold]
+                    report += f"{threshold} goals    {data['recommendation']:<16} {data['confidence']:<13} {data['votes']}\n"
+
+            # Find safest bets
+            safe_bets = []
+            for threshold, data in consensus['over_under'].items():
+                conf_value = int(data['confidence'].rstrip('%'))
+                if conf_value >= 70:
+                    safe_bets.append((data['recommendation'], data['confidence']))
+
+            if safe_bets:
+                report += "\n✅ SAFEST O/U BETS:"
+                for bet, conf in safe_bets:
+                    report += f"\n  • {bet} ({conf} confidence)"
+        else:
+            report += "\nNo over/under predictions found"
+
+        # BTTS
+        if 'btts' in consensus:
+            report += f"""
+
+{'=' * 80}
+⚽ BOTH TEAMS TO SCORE
+{'=' * 80}
+Prediction: {consensus['btts']['prediction']}
+Confidence: {consensus['btts']['confidence']}
+"""
+
+        # Betting recommendations
+        report += f"""
+
+{'=' * 80}
+💡 BETTING RECOMMENDATIONS
+{'=' * 80}
+
+Based on the analysis:
+"""
+
+        # Categorize bets by confidence
+        high_conf_bets = []
+        med_conf_bets = []
+
+        # Check winner
+        if 'winner' in consensus:
+            conf = int(consensus['winner']['confidence'].rstrip('%'))
+            bet = f"{consensus['winner']['prediction']} to win"
+            if conf >= 70:
+                high_conf_bets.append((bet, f"{conf}%"))
+            elif conf >= 50:
+                med_conf_bets.append((bet, f"{conf}%"))
+
+        # Check O/U
+        for threshold, data in consensus.get('over_under', {}).items():
+            conf = int(data['confidence'].rstrip('%'))
+            if conf >= 70:
+                high_conf_bets.append((data['recommendation'], data['confidence']))
+            elif conf >= 60:
+                med_conf_bets.append((data['recommendation'], data['confidence']))
+
+        # Check BTTS
+        if 'btts' in consensus:
+            conf = int(consensus['btts']['confidence'].rstrip('%'))
+            bet = f"BTTS {consensus['btts']['prediction']}"
+            if conf >= 70:
+                high_conf_bets.append((bet, f"{conf}%"))
+            elif conf >= 60:
+                med_conf_bets.append((bet, f"{conf}%"))
+
+        if high_conf_bets:
+            report += "\n🟢 HIGH CONFIDENCE BETS (70%+):"
+            for bet, conf in high_conf_bets:
+                report += f"\n  • {bet} - {conf}"
+
+        if med_conf_bets:
+            report += "\n\n🟡 MEDIUM CONFIDENCE BETS (50-70%):"
+            for bet, conf in med_conf_bets:
+                report += f"\n  • {bet} - {conf}"
+
+        if not high_conf_bets and not med_conf_bets:
+            report += "\n⚠️ No high-confidence bets identified"
+
+        # Warnings
+        if len(self.successful_scrapes) < len(self.urls) / 2:
+            report += f"""
+
+⚠️ WARNING: Only {len(self.successful_scrapes)} out of {len(self.urls)} articles were successfully analyzed.
+Results may not be fully representative."""
+
+        report += f"""
+
+{'=' * 80}
+📝 DISCLAIMER: This analysis is for informational purposes only.
+Always gamble responsibly and within your means.
+{'=' * 80}
+"""
+
+        return report
+
+
+# Main execution
+if __name__ == "__main__":
+    # Suppress SSL warnings
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    # URLs
+    urls = [
+        "https://www.sportsgambler.com/betting-tips/football/colorado-rapids-vs-la-galaxy-prediction-lineups-odds-2025-06-25/",
+        "https://www.sportsmole.co.uk/football/colorado-rapids/preview/colorado-vs-la-galaxy-prediction-team-news-lineups_576032.html",
+        "https://www.dimers.com/news/colorado-rapids-vs-la-galaxy-prediction-mls-ac-6-25-25",
+        "https://pickdawgz.com/mls-picks/colorado-rapids-vs-los-angeles-galaxy-prediction-06-25-2025-picks/",
+        "https://footballwhispers.com/blog/colorado-rapids-vs-los-angeles-galaxy-prediction/",
+        "https://scores24.live/en/soccer/m-26-06-2025-colorado-rapids-los-angeles-galaxy-prediction",
+        "https://www.sportskeeda.com/football/colorado-rapids-vs-la-galaxy-prediction-betting-tips-june-25-2025",
+        "https://www.docsports.com/free-picks/soccer/2025/colorado-rapids-vs-la-galaxy-prediction-6-25-2025-soccer-pick-tips-and-odds.html",
+        "https://www.footboom1.com/en/news/football/2629903-colorado-rapids-los-angeles-galaxy-match-preview-and-prediction",
+        "https://777score.com/news/football/2629899-colorado-rapids-los-angeles-galaxy-match-preview-and-prediction",
+        "https://www.sportytrader.com/us/picks/colorado-rapids-la-galaxy-274163/",
+    ]
+
+    # Initialize analyzer
+    analyzer = RobustMatchAnalyzer(
+        home_team="Rapids",
+        away_team="Galaxy",
+        match_date="2025-06-25",
+        urls=urls
+    )
+
+    # Run analysis
+    analyzer.analyze_all_urls()
+
+    # Generate report
+    report = analyzer.generate_report()
+    print("\n" + report)
+
+    # Save results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+
+    # Save report
+    with open(f"LAFC_vs_Flamengo_Report_{timestamp}.txt", 'w', encoding='utf-8') as f:
+        f.write(report)
+
+    # Save raw data
+    raw_data = {
+        'match': f"{analyzer.home_team} vs {analyzer.away_team}",
+        'date': analyzer.match_date,
+        'timestamp': timestamp,
+        'success_rate': f"{len(analyzer.successful_scrapes)}/{len(analyzer.urls)}",
+        'consensus': analyzer.build_consensus(),
+        'all_predictions': analyzer.all_predictions
+    }
+
+    with open(f"LAFC_vs_Flamengo_Data_{timestamp}.json", 'w') as f:
+        json.dump(raw_data, f, indent=2)
+
+    print(f"\n✅ Analysis complete!")
+    print(f"📄 Report saved to: LAFC_vs_Flamengo_Report_{timestamp}.txt")
+    print(f"💾 Data saved to: LAFC_vs_Flamengo_Data_{timestamp}.json")
